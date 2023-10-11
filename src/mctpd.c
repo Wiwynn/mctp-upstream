@@ -3134,15 +3134,158 @@ static int fill_uuid(ctx *ctx)
 	return rc;
 }
 
-static int setup_config(ctx *ctx)
+static int setup_static_eid(ctx *ctx)
 {
 	int rc;
+	sd_bus_error error = SD_BUS_ERROR_NULL;
+	sd_bus_message *message = NULL;
+	char **s;
+
+	rc = sd_bus_call_method(ctx->bus,
+        "xyz.openbmc_project.ObjectMapper", "/xyz/openbmc_project/object_mapper",
+        "xyz.openbmc_project.ObjectMapper", "GetSubTreePaths",
+		&error, &message, "sias", "/xyz/openbmc_project/", 0, 1, "xyz.openbmc_project.Configuration.MCTPEndpoint");
+	if (rc < 0) {
+		warnx("Failed to issue method call: %s\n", error.message);
+		goto out;
+	}
+
+	if (message == NULL) {
+		warnx("Empty configuration");
+		goto out;
+	}
+
+	sd_bus_message_read_strv(message, &s);
+	message = sd_bus_message_unref(message);
+
+	int i = 0;
+	size_t size = 0;
+	dest_phys desti = {0}, *dest = &desti;
+	peer *peer = NULL;
+	int net;
+	struct sockaddr_mctp_ext addr;
+	struct mctp_ctrl_cmd_get_eid req = {0};
+	struct mctp_ctrl_resp_get_eid *resp = NULL;
+	char *peer_path = NULL;
+
+	req.ctrl_hdr.rq_dgram_inst = RQDI_REQ;
+	req.ctrl_hdr.command_code = MCTP_CTRL_CMD_GET_ENDPOINT_ID;
+
+	while(s[i] != NULL) {
+		rc = sd_bus_get_property(ctx->bus,
+			"xyz.openbmc_project.EntityManager", s[i],
+			"xyz.openbmc_project.Configuration.MCTPEndpoint", "Address",
+			&error, &message, "t");
+		if (rc < 0) {
+			warnx("Failed to get property: %s\n", error.message);
+			goto out;
+		}
+
+		const uint64_t data = 0;
+		sd_bus_message_read(message, "t", &data);
+
+		size = sizeof(uint8_t);
+		memset(dest->hwaddr, 0x0, MAX_ADDR_LEN);
+		memcpy(dest->hwaddr, &data, size);
+		dest->hwaddr_len = size;
+
+		message = sd_bus_message_unref(message);
+
+		const char *ifname = NULL;
+		rc = sd_bus_get_property(ctx->bus,
+			"xyz.openbmc_project.EntityManager", s[i],
+			"xyz.openbmc_project.Configuration.MCTPEndpoint", "Bus",
+			&error, &message, "s");
+		if (rc < 0) {
+			warnx("Failed to get property: %s", error.message);
+			goto out;
+		}
+		sd_bus_message_read(message, "s", &ifname);
+
+		dest->ifindex = mctp_nl_ifindex_byname(ctx->nl, ifname);
+		if (dest->ifindex <= 0) {
+			warnx("Unknown ifname: %s", ifname);
+			i++;
+			continue;
+		}
+
+		rc = validate_dest_phys(ctx, dest);
+		if (rc < 0) {
+			warnx("Bad phys: 0x%02x", dest->hwaddr[0]);
+			i++;
+			continue;
+		}
+
+		net = mctp_nl_net_byindex(ctx->nl, dest->ifindex);
+		if (net < 1) {
+			warnx("No net for ifindex");
+			i++;
+			continue;
+		}
+
+		message = sd_bus_message_unref(message);
+
+		rc = sd_bus_get_property(ctx->bus,
+			"xyz.openbmc_project.EntityManager", s[i],
+			"xyz.openbmc_project.Configuration.MCTPEndpoint", "EndpointId",
+			&error, &message, "t");
+		if (rc < 0) {
+			warnx("Failed to get property: %s\n", error.message);
+			goto out;
+		}
+		uint64_t eid = 0;
+		sd_bus_message_read(message, "t", &eid);
+
+		rc = add_peer(ctx, dest, (mctp_eid_t)eid, net, &peer);
+		if (rc < 0) {
+			warnx("Failed to add peer for EID %d", (mctp_eid_t)eid);
+			i++;
+			continue;
+		}
+
+		add_peer_route(peer);
+
+		uint8_t* buf = NULL;
+		size_t buf_size = 0;
+		rc = endpoint_query_peer(peer, MCTP_CTRL_HDR_MSG_TYPE,
+		&req, sizeof(req), &buf, &buf_size, &addr);
+		if (rc < 0) {
+			warnx("Response timeout for EID %d.", (mctp_eid_t)eid);
+			remove_peer(peer);
+			free(buf);
+			i++;
+			continue;
+		}
+		free(buf);
+
+		rc = query_peer_properties(peer);
+
+		rc = publish_peer(peer, true);
+		if (rc < 0) {
+			warnx("Error publishing remote eid %d net %d", (mctp_eid_t)eid, net);
+			i++;
+			continue;
+		}
+
+		message = sd_bus_message_unref(message);
+		i++;
+	}
+
+out:
+	sd_bus_error_free(&error);
+	return 0;
+}
+
+static int setup_config(ctx *ctx)
+{
 	// TODO: this will go in a config file or arguments.
+	int rc;
 	ctx->mctp_timeout = 250000; // 250ms
 	ctx->bus_owner = true;
 	rc = fill_uuid(ctx);
 	if (rc < 0)
 		return rc;
+
 	return 0;
 }
 
@@ -3192,6 +3335,8 @@ int main(int argc, char **argv)
 	if (rc < 0 && !ctx->testing)
 		return 1;
 
+	rc = setup_static_eid(ctx);
+
 	// TODO add net argument?
 	rc = listen_control_msg(ctx, MCTP_NET_ANY);
 	if (rc < 0) {
@@ -3209,7 +3354,6 @@ int main(int argc, char **argv)
 	rc = request_dbus(ctx);
 	if (rc < 0)
 		return 1;
-
 
 	rc = sd_event_loop(ctx->event);
 	sd_event_unref(ctx->event);
