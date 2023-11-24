@@ -38,6 +38,8 @@
 #define MCTP_DBUS_IFACE "xyz.openbmc_project.MCTP"
 #define MCTP_DBUS_IFACE_ENDPOINT "xyz.openbmc_project.MCTP.Endpoint"
 #define OPENBMC_IFACE_COMMON_UUID "xyz.openbmc_project.Common.UUID"
+#define OPENBMC_MCTP_CONFIG_IFACE "xyz.openbmc_project.Configuration.MCTPEndpoint"
+#define OPENBMC_ASSOCIATION_IFACE "xyz.openbmc_project.Association.Definitions"
 
 // an arbitrary constant for use with sd_id128_get_machine_app_specific()
 static const char* mctpd_appid = "67369c05-4b97-4b7e-be72-65cfd8639f10";
@@ -70,6 +72,13 @@ struct ctx;
 
 // all local peers have the same phys
 static const dest_phys local_phys = { .ifindex = 0 };
+
+struct association {
+	char *forward;
+	char *reverse;
+	char *object_path;
+};
+typedef struct association association;
 
 struct peer {
 	int net;
@@ -109,6 +118,9 @@ struct peer {
 
 	// From Get Endpoint UUID. A malloced 16 bytes */
 	uint8_t *uuid;
+
+	// the association is an struct of (forward, reverse, object_path)
+	association *association;
 
 	// Stuff the ctx pointer into peer for tidier parameter passing
 	struct ctx *ctx;
@@ -211,6 +223,18 @@ static peer * find_peer_by_addr(ctx *ctx, mctp_eid_t eid, int net)
 
 	if (eid != 0 && n && n->peeridx[eid] >= 0)
 		return &ctx->peers[n->peeridx[eid]];
+	return NULL;
+}
+
+static peer * find_peer_by_association(ctx *ctx, const char *object_path)
+{
+	for (size_t i = 0; i < ctx->size_peers; i++) {
+		peer *peer = &ctx->peers[i];
+		if (peer->state != REMOTE)
+			continue;
+		if (strcmp(peer->association->object_path, object_path))
+			return peer;
+	}
 	return NULL;
 }
 
@@ -1243,6 +1267,12 @@ static int remove_peer(peer *peer)
 	n->peeridx[peer->eid] = -1;
 	free(peer->message_types);
 	free(peer->uuid);
+	if (peer->association) {
+		free(peer->association->forward);
+		free(peer->association->reverse);
+		free(peer->association->object_path);
+		free(peer->association);
+	}
 	memset(peer, 0x0, sizeof(struct peer));
 	return 0;
 }
@@ -1666,6 +1696,159 @@ static int message_read_hwaddr(sd_bus_message *call, dest_phys* dest)
 	return 0;
 }
 
+static int setup_static_eid(ctx *ctx)
+{
+	int rc;
+	sd_bus_error error = SD_BUS_ERROR_NULL;
+	sd_bus_message *message = NULL;
+	char **s;
+
+	rc = sd_bus_call_method(ctx->bus,
+        "xyz.openbmc_project.ObjectMapper", "/xyz/openbmc_project/object_mapper",
+        "xyz.openbmc_project.ObjectMapper", "GetSubTreePaths",
+		&error, &message, "sias", "/xyz/openbmc_project/", 0, 1, OPENBMC_MCTP_CONFIG_IFACE);
+	if (rc < 0) {
+		warnx("Failed to issue method call: %s\n", error.message);
+		goto out;
+	}
+
+	sd_bus_message_read_strv(message, &s);
+	message = sd_bus_message_unref(message);
+
+	// check if there is configuration found
+	if (!s)
+		goto out;
+
+
+	int i = 0;
+	size_t size = 0;
+	dest_phys desti = {0}, *dest = &desti;
+	peer *peer = NULL;
+	int net;
+	struct sockaddr_mctp_ext addr;
+	struct mctp_ctrl_cmd_get_eid req = {0};
+	struct mctp_ctrl_resp_get_eid *resp = NULL;
+	char *peer_path = NULL;
+
+	req.ctrl_hdr.rq_dgram_inst = RQDI_REQ;
+	req.ctrl_hdr.command_code = MCTP_CTRL_CMD_GET_ENDPOINT_ID;
+
+	while(s[i] != NULL) {
+		rc = sd_bus_get_property(ctx->bus,
+			"xyz.openbmc_project.EntityManager", s[i],
+			OPENBMC_MCTP_CONFIG_IFACE, "Address",
+			&error, &message, "t");
+		if (rc < 0) {
+			warnx("Failed to get property: %s\n", error.message);
+			goto out;
+		}
+
+		const uint64_t data = 0;
+		sd_bus_message_read(message, "t", &data);
+
+		size = sizeof(uint8_t);
+		memset(dest->hwaddr, 0x0, MAX_ADDR_LEN);
+		memcpy(dest->hwaddr, &data, size);
+		dest->hwaddr_len = size;
+
+		message = sd_bus_message_unref(message);
+
+		const char *ifname = NULL;
+		rc = sd_bus_get_property(ctx->bus,
+			"xyz.openbmc_project.EntityManager", s[i],
+			OPENBMC_MCTP_CONFIG_IFACE, "Bus",
+			&error, &message, "s");
+		if (rc < 0) {
+			warnx("Failed to get property: %s", error.message);
+			goto out;
+		}
+		sd_bus_message_read(message, "s", &ifname);
+
+		dest->ifindex = mctp_nl_ifindex_byname(ctx->nl, ifname);
+		if (dest->ifindex <= 0) {
+			warnx("Unknown ifname: %s", ifname);
+			i++;
+			continue;
+		}
+
+		rc = validate_dest_phys(ctx, dest);
+		if (rc < 0) {
+			warnx("Bad phys: 0x%02x", dest->hwaddr[0]);
+			i++;
+			continue;
+		}
+
+		net = mctp_nl_net_byindex(ctx->nl, dest->ifindex);
+		if (net < 1) {
+			warnx("No net for ifindex");
+			i++;
+			continue;
+		}
+
+		message = sd_bus_message_unref(message);
+
+		rc = sd_bus_get_property(ctx->bus,
+			"xyz.openbmc_project.EntityManager", s[i],
+			OPENBMC_MCTP_CONFIG_IFACE, "EndpointId",
+			&error, &message, "t");
+		if (rc < 0) {
+			warnx("Failed to get property: %s\n", error.message);
+			goto out;
+		}
+		uint64_t eid = 0;
+		sd_bus_message_read(message, "t", &eid);
+
+		rc = add_peer(ctx, dest, (mctp_eid_t)eid, net, &peer);
+		if (rc < 0) {
+			warnx("Failed to add peer for EID %d", (mctp_eid_t)eid);
+			i++;
+			continue;
+		}
+
+		add_peer_route(peer);
+
+		uint8_t* buf = NULL;
+		size_t buf_size = 0;
+		rc = endpoint_query_peer(peer, MCTP_CTRL_HDR_MSG_TYPE,
+		&req, sizeof(req), &buf, &buf_size, &addr);
+		if (rc < 0) {
+			warnx("Response timeout for EID %d.", (mctp_eid_t)eid);
+			remove_peer(peer);
+			free(buf);
+			i++;
+			continue;
+		}
+		free(buf);
+
+		rc = query_peer_properties(peer);
+
+		// Get parent path
+		char object_path[100];
+		strcpy(object_path, s[i]);
+		char *ret = strrchr(object_path, '/');
+		*ret = '\0';
+
+		peer->association = malloc(sizeof(struct association));
+		peer->association->forward = strdup("chassis");
+		peer->association->reverse = strdup("mctp_endpoints");
+		peer->association->object_path = strdup(object_path);
+
+		rc = publish_peer(peer, true);
+		if (rc < 0) {
+			warnx("Error publishing remote eid %d net %d", (mctp_eid_t)eid, net);
+			i++;
+			continue;
+		}
+
+		message = sd_bus_message_unref(message);
+		i++;
+	}
+
+out:
+	sd_bus_error_free(&error);
+	return 0;
+}
+
 /* SetupEndpoint method tries the following in order:
   - request Get Endpoint ID to add to the known table, return that
   - request Set Endpoint ID, return that */
@@ -1828,6 +2011,18 @@ static int method_learn_endpoint(sd_bus_message *call, void *data, sd_bus_error 
 	return sd_bus_reply_method_return(call, "yisb", peer->eid, peer->net,
 		peer_path, 1);
 err:
+	set_berr(ctx, rc, berr);
+	return rc;
+}
+
+static int method_setup_endpoint_by_config(sd_bus_message *call, void *data, sd_bus_error *berr)
+{
+	int rc = 0;
+	ctx *ctx = data;
+	rc = setup_static_eid(ctx);
+
+	rc = sd_bus_reply_method_return(call, "");
+out:
 	set_berr(ctx, rc, berr);
 	return rc;
 }
@@ -2274,6 +2469,11 @@ static const sd_bus_vtable bus_mctpd_vtable[] = {
 		SD_BUS_PARAM(found),
 		method_learn_endpoint,
 		0),
+	SD_BUS_METHOD_WITH_ARGS("SetupEndpointByConfig",
+		SD_BUS_NO_ARGS,
+		SD_BUS_NO_RESULT,
+		method_setup_endpoint_by_config,
+		0),
 	SD_BUS_VTABLE_END,
 
 };
@@ -2337,6 +2537,9 @@ static int bus_endpoint_get_prop(sd_bus *bus,
 	} else if (strcmp(property, "UUID") == 0 && peer->uuid) {
 		const char *s = dfree(bytes_to_uuid(peer->uuid));
 		rc = sd_bus_message_append(reply, "s", s);
+	} else if (strcmp(property, "Associations") == 0 && peer->association) {
+		rc = sd_bus_message_append(reply, "a(sss)",
+			1, peer->association->forward, peer->association->reverse, peer->association->object_path);
 	} else {
 		printf("Unknown property '%s' for %s iface %s\n", property, path, interface);
 		rc = -ENOENT;
@@ -2390,6 +2593,16 @@ static const sd_bus_vtable bus_endpoint_cc_vtable[] = {
 	SD_BUS_VTABLE_END
 };
 
+static const sd_bus_vtable bus_endpoint_association_vtable[] = {
+	SD_BUS_VTABLE_START(0),
+	SD_BUS_PROPERTY("Associations",
+			"a(sss)",
+			bus_endpoint_get_prop,
+			0,
+			SD_BUS_VTABLE_PROPERTY_CONST),
+	SD_BUS_VTABLE_END
+};
+
 static int bus_endpoint_find(sd_bus *bus, const char *path,
 	const char *interface, void *userdata, void **ret_found,
 	sd_bus_error *ret_error)
@@ -2418,6 +2631,26 @@ static int bus_endpoint_find_uuid(sd_bus *bus, const char *path,
 	rc = peer_from_path(ctx, path, &peer);
 	if (rc >= 0 && peer->published) {
 		if (peer->uuid) {
+			*ret_found = peer;
+			return 1;
+		}
+	}
+	return 0;
+}
+
+/* Association.Definitions interface is only added for peers that get EID
+   configuration from entity-manager */
+static int bus_endpoint_find_association(sd_bus *bus, const char *path,
+	const char *interface, void *userdata, void **ret_found,
+	sd_bus_error *ret_error)
+{
+	ctx *ctx = userdata;
+	peer *peer = NULL;
+	int rc;
+
+	rc = peer_from_path(ctx, path, &peer);
+	if (rc >= 0 && peer->published) {
+		if (peer->association) {
 			*ret_found = peer;
 			return 1;
 		}
@@ -2584,6 +2817,93 @@ out:
 	return rc;
 }
 
+int on_interface_added(sd_bus_message *m, void *userdata, sd_bus_error *ret_error)
+{
+	int rc = 0;
+	bool update = false;
+	ctx *ctx = userdata;
+	char *object_path, *iface;
+
+	rc = sd_bus_message_read(m, "o", &object_path);
+	if (rc < 0)
+		goto out;
+
+	rc = sd_bus_message_enter_container(m, SD_BUS_TYPE_ARRAY, "{sa{sv}}");
+	if (rc < 0)
+		goto out;
+
+	for(;;) {
+		rc = sd_bus_message_enter_container(m, SD_BUS_TYPE_DICT_ENTRY, "sa{sv}");
+		if (rc == 0)
+			break;
+
+		rc = sd_bus_message_read(m, "s", &iface);
+		if (rc == 0)
+			break;
+
+		if (strcmp(iface,OPENBMC_MCTP_CONFIG_IFACE) != 0) {
+			sd_bus_message_skip(m, "a{sv}");
+		}
+		else {
+			sd_bus_message_skip(m, "a{sv}");
+			update = true;
+		}
+		sd_bus_message_exit_container(m);
+	}
+	sd_bus_message_exit_container(m);
+
+	if (update == true)
+		setup_static_eid(ctx);
+
+out:
+	return rc;
+}
+
+int on_interface_removed(sd_bus_message *m, void *userdata, sd_bus_error *ret_error)
+{
+	int rc = 0;
+	bool update = false;
+	ctx *ctx = userdata;
+	char *object_path, *iface;
+	peer *peer = NULL;
+
+	rc = sd_bus_message_read(m, "o", &object_path);
+	if (rc < 0)
+		goto out;
+
+	rc = sd_bus_message_enter_container(m, SD_BUS_TYPE_ARRAY, "s");
+	if (rc < 0)
+		goto out;
+
+	for(;;) {
+		rc = sd_bus_message_read(m, "s", &iface);
+		if (rc == 0)
+			break;
+		warnx("iface = %s", iface);
+		if(strcmp(iface,OPENBMC_MCTP_CONFIG_IFACE) == 0) {
+			update = true;
+		}
+	}
+
+	if (update == true) {
+		char temp[100];
+		strcpy(temp, object_path);
+		char *ret = strrchr(temp, '/');
+		*ret = '\0';
+
+		for(;;) {
+			peer = find_peer_by_association(ctx, temp);
+			if (peer)
+				remove_peer(peer);
+			else
+				break;
+		}
+	}
+
+out:
+	return rc;
+}
+
 static int setup_bus(ctx *ctx)
 {
 	int rc;
@@ -2655,6 +2975,17 @@ static int setup_bus(ctx *ctx)
 		goto out;
 	}
 
+	rc = sd_bus_add_fallback_vtable(ctx->bus, NULL,
+					MCTP_DBUS_PATH,
+					OPENBMC_ASSOCIATION_IFACE,
+					bus_endpoint_association_vtable,
+					bus_endpoint_find_association,
+					ctx);
+	if (rc < 0) {
+		warnx("Failed adding association D-Bus interface: %s", strerror(-rc));
+		goto out;
+	}
+
 	rc = sd_bus_add_object_manager(ctx->bus, NULL, MCTP_DBUS_PATH);
 	if (rc < 0) {
 		warnx("Adding object manager failed: %s", strerror(-rc));
@@ -2665,6 +2996,36 @@ static int setup_bus(ctx *ctx)
 		MCTP_DBUS_PATH, mctpd_dbus_enumerate, ctx);
 	if (rc < 0) {
 		warnx("Failed to add node enumerator: %s", strerror(-rc));
+		goto out;
+	}
+
+	rc = sd_bus_match_signal(
+		ctx->bus,
+		NULL,
+		NULL,
+		"/xyz/openbmc_project/inventory",
+		"org.freedesktop.DBus.ObjectManager",
+		"InterfacesAdded",
+		on_interface_added,
+		ctx
+	);
+	if (rc < 0) {
+		warnx("Failed to add match signal for InterfacesAdded");
+		goto out;
+	}
+
+	rc = sd_bus_match_signal(
+		ctx->bus,
+		NULL,
+		NULL,
+		"/xyz/openbmc_project/inventory",
+		"org.freedesktop.DBus.ObjectManager",
+		"InterfacesRemoved",
+		on_interface_removed,
+		ctx
+	);
+	if (rc < 0) {
+		warnx("Failed to add match signal for InterfacesRemoved");
 		goto out;
 	}
 
@@ -3132,148 +3493,6 @@ static int fill_uuid(ctx *ctx)
 		warnx("Failed to get boot ID");
 
 	return rc;
-}
-
-static int setup_static_eid(ctx *ctx)
-{
-	int rc;
-	sd_bus_error error = SD_BUS_ERROR_NULL;
-	sd_bus_message *message = NULL;
-	char **s;
-
-	rc = sd_bus_call_method(ctx->bus,
-        "xyz.openbmc_project.ObjectMapper", "/xyz/openbmc_project/object_mapper",
-        "xyz.openbmc_project.ObjectMapper", "GetSubTreePaths",
-		&error, &message, "sias", "/xyz/openbmc_project/", 0, 1, "xyz.openbmc_project.Configuration.MCTPEndpoint");
-	if (rc < 0) {
-		warnx("Failed to issue method call: %s\n", error.message);
-		goto out;
-	}
-
-	if (message == NULL) {
-		warnx("Empty configuration");
-		goto out;
-	}
-
-	sd_bus_message_read_strv(message, &s);
-	message = sd_bus_message_unref(message);
-
-	int i = 0;
-	size_t size = 0;
-	dest_phys desti = {0}, *dest = &desti;
-	peer *peer = NULL;
-	int net;
-	struct sockaddr_mctp_ext addr;
-	struct mctp_ctrl_cmd_get_eid req = {0};
-	struct mctp_ctrl_resp_get_eid *resp = NULL;
-	char *peer_path = NULL;
-
-	req.ctrl_hdr.rq_dgram_inst = RQDI_REQ;
-	req.ctrl_hdr.command_code = MCTP_CTRL_CMD_GET_ENDPOINT_ID;
-
-	while(s[i] != NULL) {
-		rc = sd_bus_get_property(ctx->bus,
-			"xyz.openbmc_project.EntityManager", s[i],
-			"xyz.openbmc_project.Configuration.MCTPEndpoint", "Address",
-			&error, &message, "t");
-		if (rc < 0) {
-			warnx("Failed to get property: %s\n", error.message);
-			goto out;
-		}
-
-		const uint64_t data = 0;
-		sd_bus_message_read(message, "t", &data);
-
-		size = sizeof(uint8_t);
-		memset(dest->hwaddr, 0x0, MAX_ADDR_LEN);
-		memcpy(dest->hwaddr, &data, size);
-		dest->hwaddr_len = size;
-
-		message = sd_bus_message_unref(message);
-
-		const char *ifname = NULL;
-		rc = sd_bus_get_property(ctx->bus,
-			"xyz.openbmc_project.EntityManager", s[i],
-			"xyz.openbmc_project.Configuration.MCTPEndpoint", "Bus",
-			&error, &message, "s");
-		if (rc < 0) {
-			warnx("Failed to get property: %s", error.message);
-			goto out;
-		}
-		sd_bus_message_read(message, "s", &ifname);
-
-		dest->ifindex = mctp_nl_ifindex_byname(ctx->nl, ifname);
-		if (dest->ifindex <= 0) {
-			warnx("Unknown ifname: %s", ifname);
-			i++;
-			continue;
-		}
-
-		rc = validate_dest_phys(ctx, dest);
-		if (rc < 0) {
-			warnx("Bad phys: 0x%02x", dest->hwaddr[0]);
-			i++;
-			continue;
-		}
-
-		net = mctp_nl_net_byindex(ctx->nl, dest->ifindex);
-		if (net < 1) {
-			warnx("No net for ifindex");
-			i++;
-			continue;
-		}
-
-		message = sd_bus_message_unref(message);
-
-		rc = sd_bus_get_property(ctx->bus,
-			"xyz.openbmc_project.EntityManager", s[i],
-			"xyz.openbmc_project.Configuration.MCTPEndpoint", "EndpointId",
-			&error, &message, "t");
-		if (rc < 0) {
-			warnx("Failed to get property: %s\n", error.message);
-			goto out;
-		}
-		uint64_t eid = 0;
-		sd_bus_message_read(message, "t", &eid);
-
-		rc = add_peer(ctx, dest, (mctp_eid_t)eid, net, &peer);
-		if (rc < 0) {
-			warnx("Failed to add peer for EID %d", (mctp_eid_t)eid);
-			i++;
-			continue;
-		}
-
-		add_peer_route(peer);
-
-		uint8_t* buf = NULL;
-		size_t buf_size = 0;
-		rc = endpoint_query_peer(peer, MCTP_CTRL_HDR_MSG_TYPE,
-		&req, sizeof(req), &buf, &buf_size, &addr);
-		if (rc < 0) {
-			warnx("Response timeout for EID %d.", (mctp_eid_t)eid);
-			remove_peer(peer);
-			free(buf);
-			i++;
-			continue;
-		}
-		free(buf);
-
-		rc = query_peer_properties(peer);
-
-		rc = publish_peer(peer, true);
-		if (rc < 0) {
-			warnx("Error publishing remote eid %d net %d", (mctp_eid_t)eid, net);
-			i++;
-			continue;
-		}
-
-		message = sd_bus_message_unref(message);
-		i++;
-	}
-
-out:
-	sd_bus_error_free(&error);
-	return 0;
 }
 
 static int setup_config(ctx *ctx)
